@@ -1,4 +1,4 @@
-name: Build GDI Virus
+name: Build GDI Locker
 on: [push, workflow_dispatch]
 
 jobs:
@@ -6,23 +6,17 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
       - name: Build EXE
         run: |
-          pyinstaller --noconsole --onefile --uac-admin --add-data "music.mp3;." --name GDI_Virus gdi_virus.py
-
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+          pyinstaller --noconsole --onefile --uac-admin --name GDI_Locker gdi_locker.py
+      - uses: actions/upload-artifact@v4
         with:
-          name: gdi-virus-exe
-          path: dist/GDI_Virus.exe
+          name: gdi-locker
+          path: dist/GDI_Locker.exe
